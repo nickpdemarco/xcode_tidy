@@ -23,71 +23,87 @@ import tempfile
 # See requirements.txt
 import yaml
 
-# The proper way to do this should be an option to clang-tidy to output as a analyzer-friendly
-# plist. But that may have to be post-MVP. For now, we use the fact that warnings take the form:
-# /Path/To/file.cpp:<Line>:<Column> <Category>: <Note> [<Diagnostic Type>]
-class CAPTURE_GROUP():
-    FILE_PATH = 0       # Absolute file path.
-    LINE = 1            # Line where diagnostic occurred
-    COLUMN = 2          # column where diagnostic ocurred
-    LEVEL = 3           # warning, info, error, etc
-    DESCRIPTION = 4     # description of diagnostic
-    CHECK_NAME = 5      # Check name [llvm.exampleCheck.foo]
+# Don't forget about the symlink at  /Applications/Xcode_11/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/9.0.0/include!!!
 
-TIDY_WARNING_REGEX = re.compile("((?:\/.*){3,}):([0-9]+):([0-9]+):\s*(.*):\s*(.*)\s*(\[.*\])")
-# This makes the check name optional. Unclear if needed yet.
-# TIDY_WARNING_REGEX = re.compile("((?:\/.*){3,}):([0-9]+):([0-9]+):\s*(.*):\s*(.*)(\s*\[.*\]){0,1}")
-
-FLAGS_WITH_SPACE_SPARATED_ARGUMENTS = [ # TODO This is likely an incomplete list 
-    "-x",
-    "-target",
-    "-isysroot",
-    "-iquote",
-    "-MT",
-    "-MF",
-    "--analyze",
-    "-o",
-]
+CLANG_TIDY_DIR = "/Applications/Xcode_11/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin"
+CLANG_TIDY_PATH = "{}/clang-tidy".format(CLANG_TIDY_DIR)
 
 ###
-# Args and Utilities 
+# Utilities
+# =================================================================================================
+# General purpose utilities that have no dependency on clang-tidy.
+###
+
+def find_if(sequence, predicate):
+    return next((x for x in sequence if predicate(x)), None)
+
+def sorted_unique_list(generator):
+    return sorted(list(set(generator)))
+
+###
+# Args and Clang Tidy Config
 # =================================================================================================
 # The args object represents a dictionary of the arguments given to us by Xcode.
 # The "tidy config" is a dictionary representation of clang-tidy --dump-config.
 ###
 
 class args:
-    def __getitem__(self, key):
-        try:
-            return getattr(self, key)
-        except:
-            return None
+    def __init__(self, argv):
+        self.list = list(args.generator(argv[1:]))
 
-    def __iter__(self):
-        return vars(self).iteritems()
+    # For flags `likeThis=100`, return `100`.
+    # For flags `-likeThis`, return `-likeThis`.
+    # For flags with parameters `-like this`, return `this`
+    # Returns first found instance.
+    def __getitem__(self, flag):
+        found = find_if(self.list, lambda x: x[0].startswith(flag))
+        if not found: return None
+        return found[0][found.index('=') + 1:] if '=' in found[0] else found[-1]
 
-def make_args(argv):
-    result = args()
-
-    N = len(argv)
-    i = 0
-    while i < N:
-        arg = argv[i]
-        if arg in FLAGS_WITH_SPACE_SPARATED_ARGUMENTS:
-            setattr(result, arg, argv[i + 1])
-            i += 2
-        elif '=' in arg:
-            spl = arg.split('=')
-            setattr(result, spl[0], spl[1])
-            i += 1
-        else:
-            setattr(result, arg, True)
-            i += 1
+    # Return our list of arg lists concatenated together
+    def as_flat_list(self):
+        return [parameter for arg in self.list for parameter in arg]
     
-    return result
+    # Return our list of arg lists concatenated together, removing
+    # arguments that are intended for the clang static analyzer, and
+    # should not be passed to clang-tidy's clang invocation.
+    def as_pruned_flat_list(self):
+        return [parameter for arg in self.list for parameter in arg if not args.should_be_pruned(arg)]
+    
+    @staticmethod
+    # Prune out arguments that are intended for an actual analyzer context.
+    def should_be_pruned(arg):
+        return any([arg[0].startswith(k) for k in [
+            '-Xclang', '-D__clang_analyzer__', '--analyze',
+            '-fmodules', '-gmodules',
+        ]])
+
+    @staticmethod
+    def is_flag(arg):
+        return arg[0] == '-'
+
+    @staticmethod
+    def takes_flag_as_parameter(arg):
+        return arg == '-Xclang'
+
+    @staticmethod
+    def generator(argv):
+        if not argv: return
+        if not args.is_flag(argv[0]):
+            raise RuntimeError("Argument list starts without a flag.")
+
+        acc = [argv[0]]
+        for arg in argv[1:]:
+            if args.is_flag(arg) and not args.takes_flag_as_parameter(acc[-1]):
+                yield acc
+                acc = [arg]
+            else:
+                acc.append(arg)
+
+        yield acc
 
 def get_tidy_config():
-    command = ["/Users/demarco/clang-tidy", "--dump-config"]
+    command = [CLANG_TIDY_PATH, "--dump-config"]
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     out, err = process.communicate()
     try:
@@ -101,9 +117,6 @@ def xcode_select_path():
     if not XCODE_SELECT_PATH:
         XCODE_SELECT_PATH = subprocess.check_output(["xcode-select", "-p"]).strip()
     return XCODE_SELECT_PATH
-
-def find_if(sequence, predicate):
-    return next((x for x in sequence if predicate(x)), None)
 
 ###
 # The Dependencies File 
@@ -141,28 +154,54 @@ def make_dependencies_file(args, dependentFiles):
 # =================================================================================================
 ###
 
+# For reasons that remain unclear to me, the Apple Clang distribution has no issue compiling the following program:
+# 
+# #include <xmmintrin.h>
+# int main() {}
+# 
+# Yet, clang-tidy errors-out on two missing symbols (stubbed below). The goal is to only define these identifiers
+# executing analyers that will not generate machine code that is executed.
+# 
+# Work remains to identify why Apple Clang differs from clang-tidy, and if clang 9.0 exhibits the same behavior.
+# 
+# These are indeed GCC builtins:
+#     https://gcc.gnu.org/onlinedocs/gcc-4.2.3/gcc/X86-Built_002din-Functions.html
+# And clang claims to support all GCC builtins.
+#     https://releases.llvm.org/3.1/tools/clang/docs/LanguageExtensions.html#builtins
+#
+# Here, we define those builtins to be macros that abort ungracefully.
+def clang_builtin_workaround_flags():
+    return ["-D__builtin_ia32_storehps(...)=__builtin_trap()",
+            "-D__builtin_ia32_storelps(...)=__builtin_trap()"]
+
 # Arguments to be passed to the clang compiler behind clang-tidy.
-# AKA the args after "--" in the clang-tidy invocation. All header search paths for now.
+# AKA the args after "--" in the clang-tidy invocation.
 def get_clang_arguments(args):
-
-    result = ["-isysroot", args["-isysroot"], "--trace-includes"]
-
+    result = []
     xcode_path = xcode_select_path()
-    # Why do I need to do these next two? Does xcode really include search paths not listed in the compile command?
-    result.append( "-I{}/Toolchains/XcodeDefault.xctoolchain/usr/include/c++/v1/".format(xcode_path))
-    # This feels fragile. Derive path from xcode version number?
-    result.append( "-I{}/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/11.0.0/include/".format(xcode_path))
 
-    for flag, value in args:
-        if flag.startswith("-I"):
-            result.append(flag)
+    # result.append("-isystem{}/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/11.0.0/include".format(xcode_path))
+    # result.append("-isystem{}/Toolchains/XcodeDefault.xctoolchain/usr/include".format(xcode_path))
+    # result.append("-isystem{}/Toolchains/XcodeDefault.xctoolchain/usr/include/c++/v1".format(xcode_path))
 
+    # result.append("-isystem{}/Toolchains/XcodeDefault.xctoolchain/usr/include/c++/v1".format(xcode_path))
+    # result.append("-isystem{}/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/11.0.0/include".format(xcode_path))
+
+    result.append("-isystem{}/Toolchains/XcodeDefault.xctoolchain/usr/include".format(xcode_path))
+    # if args.wants_workaround:
+    result.extend(clang_builtin_workaround_flags())
+    result.extend(args.as_pruned_flat_list())
+
+    # /Applications/Xcode_11/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/11.0.0/include 
+    # /Applications/Xcode_11/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include   
     return result        
 
 def invoke_clang_tidy(args):
-    command = ["/Users/demarco/clang-tidy", args["--analyze"]]
+    command = [CLANG_TIDY_PATH, args["--analyze"]]
     command += ["--"]
     command += get_clang_arguments(args)
+    command += ["-v"]
+    print ' '.join(command)
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     out, err = process.communicate()
     return (process.returncode, out, err)
@@ -176,6 +215,21 @@ def invoke_clang_tidy(args):
 # static analyzer warnings. At this time, we do not make use of the "path" feature supported by
 # this format, which allows in-editor tracing of the path of execution that led to the diagnostic.
 ###
+
+# The proper way to do this should be a clang-tidy argument to output as a analyzer-friendly
+# plist. But that may have to be post-MVP. For now, we use the fact that warnings take the form:
+# /Path/To/file.cpp:<Line>:<Column> <Category>: <Note> [<Diagnostic Type>]
+class CAPTURE_GROUP():
+    FILE_PATH = 0       # Absolute file path.
+    LINE = 1            # Line where diagnostic occurred
+    COLUMN = 2          # column where diagnostic ocurred
+    LEVEL = 3           # warning, info, error, etc
+    DESCRIPTION = 4     # description of diagnostic
+    CHECK_NAME = 5      # Check name [llvm.exampleCheck.foo]
+
+TIDY_WARNING_REGEX = re.compile("((?:\/.*){3,}):([0-9]+):([0-9]+):\s*(.*):\s*(.*)\s*(\[.*\])")
+# This makes the check name optional. Unclear if needed yet.
+# TIDY_WARNING_REGEX = re.compile("((?:\/.*){3,}):([0-9]+):([0-9]+):\s*(.*):\s*(.*)(\s*\[.*\]){0,1}")
 
 def make_diagnostic(match, fileIndex):
     return {
@@ -194,12 +248,11 @@ def make_diagnostics(matches, affectedFiles):
 
 def parse_clang_tidy_output(output):
     matches = re.findall(TIDY_WARNING_REGEX, output)
-    affectedFiles = sorted(list( { m[CAPTURE_GROUP.FILE_PATH] for m in matches } )) # Sorted, unique list.
-    json_dict = {
+    affectedFiles = sorted_unique_list( m[CAPTURE_GROUP.FILE_PATH] for m in matches )
+    return json.dumps({
         "files" : affectedFiles,
         "diagnostics" : make_diagnostics(matches, affectedFiles)
-    }
-    return json.dumps(json_dict)
+    })
 
 def make_output_plist(path, output):
     # Write a temp file out as json, then use plutil to convert to an apple-friendly plist file.
@@ -213,12 +266,14 @@ def make_output_plist(path, output):
         out, err = process.communicate()
 
 ###
-# Main ============================================================================================
+# Main 
+# ============================================================================================
 ###
 
 if __name__ == "__main__":
-    args = make_args(sys.argv)
+    args = args(sys.argv)
     config = get_tidy_config()
+
     retcode, output, error = invoke_clang_tidy(args)
 
     # When we pass --trace-includes to clang, the result seems to go to stderr of clang-tidy.
@@ -227,5 +282,8 @@ if __name__ == "__main__":
 
     if output:
         make_output_plist(args["-o"], output)
+
+    if error:
+        print "ERR\n{}".format(error)
 
     sys.exit(retcode)
